@@ -69,6 +69,11 @@ SPOTIFY_URL_RE = re.compile(
 )
 URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
+# The android client dodges YouTube's "Sign in to confirm you're not a bot"
+# checks that datacenter IPs (Render, etc.) trigger on the web client; web is
+# kept as the primary for when it works. (tv/web_safari no longer give URLs.)
+_YT_CLIENTS = {"youtube": {"player_client": ["web", "android"]}}
+
 YTDL_PLAY_OPTS = {
     "format": "bestaudio[acodec!=none]/bestaudio/best",
     "quiet": True,
@@ -77,6 +82,7 @@ YTDL_PLAY_OPTS = {
     "default_search": "ytsearch1",
     "source_address": "0.0.0.0",
     "skip_download": True,
+    "extractor_args": _YT_CLIENTS,
 }
 
 YTDL_QUEUE_OPTS = {
@@ -88,6 +94,7 @@ YTDL_QUEUE_OPTS = {
     "source_address": "0.0.0.0",
     "skip_download": True,
     "playlistend": MAX_PLAYLIST_TRACKS,
+    "extractor_args": _YT_CLIENTS,
 }
 
 FFMPEG_BEFORE = "-loglevel error -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin"
@@ -115,6 +122,25 @@ def ffmpeg_before_options(info: dict) -> str:
         return FFMPEG_BEFORE
     hdr = "".join(f"{k}: {v}\r\n" for k, v in headers.items() if '"' not in str(v))
     return f'{FFMPEG_BEFORE} -headers "{hdr}"'
+
+
+def make_source(stream_url: str, info: dict, volume_pct: int, seek: float = 0.0) -> discord.FFmpegOpusAudio:
+    """Build the audio source with decode, volume, and opus encode all inside
+    ffmpeg. Keeping the bot process out of the audio path means the event loop
+    stays responsive on tiny cloud CPUs (buttons answer instantly even mid-song)."""
+    before = ffmpeg_before_options(info)
+    if seek > 0:
+        before = f"-ss {seek:.2f} " + before
+    opts = f"-vn -af volume={volume_amp(volume_pct):.4f} -compression_level 5"
+    return discord.FFmpegOpusAudio(
+        stream_url,
+        executable=FFMPEG_EXE,
+        bitrate=96,
+        codec="libopus",
+        before_options=before,
+        options=opts,
+        stderr=FFMPEG_LOG,
+    )
 
 
 def volume_amp(pct: int) -> float:
@@ -154,6 +180,8 @@ class GuildPlayer:
     current: Optional[Track] = None
     text_channel: Optional[discord.abc.Messageable] = None
     task: Optional[asyncio.Task] = None
+    stream_url: Optional[str] = None    # current track's resolved stream (for live volume swaps)
+    stream_info: Optional[dict] = None
 
 
 def load_playlists() -> dict:
@@ -465,16 +493,9 @@ async def player_loop(player: GuildPlayer):
             continue
 
         log.info("Playing %r (protocol=%s, codec=%s)", track.title, info.get("protocol"), info.get("acodec"))
-        source = discord.PCMVolumeTransformer(
-            discord.FFmpegPCMAudio(
-                stream_url,
-                executable=FFMPEG_EXE,
-                before_options=ffmpeg_before_options(info),
-                options=FFMPEG_OPTS,
-                stderr=FFMPEG_LOG,
-            ),
-            volume=volume_amp(player.volume_pct),
-        )
+        source = make_source(stream_url, info, player.volume_pct)
+        player.stream_url = stream_url
+        player.stream_info = info
         player.current = track
         player.next_event.clear()
 
@@ -843,10 +864,16 @@ async def loop(interaction: discord.Interaction, mode: app_commands.Choice[str])
 async def volume(interaction: discord.Interaction, percent: app_commands.Range[int, 1, 100]):
     player = bot.get_player(interaction.guild)
     player.volume_pct = percent
-    vc = interaction.guild.voice_client
-    if vc and vc.source and isinstance(vc.source, discord.PCMVolumeTransformer):
-        vc.source.volume = volume_amp(percent)
     await interaction.response.send_message(f"🔊 Volume: **{percent}%**")
+    # restart the current stream at the same position with the new volume baked in
+    vc = interaction.guild.voice_client
+    audio = getattr(vc, "_player", None) if vc else None
+    if vc and audio and player.stream_url and (vc.is_playing() or vc.is_paused()):
+        try:
+            elapsed = audio.loops * 0.02  # 20ms opus frames played so far
+            vc.source = make_source(player.stream_url, player.stream_info or {}, percent, seek=elapsed)
+        except Exception:
+            log.exception("Live volume swap failed — new volume applies from the next song")
 
 
 @bot.tree.command(description="Remove a song from the queue by its position")
@@ -874,9 +901,6 @@ async def clear(interaction: discord.Interaction):
 # Saved playlists (/playlist ...)
 # --------------------------------------------------------------------------
 
-playlist_group = app_commands.Group(name="playlist", description="Create and play your saved playlists")
-
-
 def user_playlists(user: discord.abc.User) -> dict:
     return bot.playlists.setdefault(str(user.id), {})
 
@@ -890,14 +914,6 @@ def dict_to_track(d: dict, requester: str) -> Track:
         query=d["query"], title=d.get("title", "Unknown title"), requested_by=requester,
         duration=d.get("duration"), webpage_url=d.get("webpage_url"),
     )
-
-
-async def playlist_name_autocomplete(interaction: discord.Interaction, current: str):
-    names = bot.playlists.get(str(interaction.user.id), {})
-    return [
-        app_commands.Choice(name=n, value=n)
-        for n in names if current.lower() in n.lower()
-    ][:25]
 
 
 def playlist_songs_embed(name: str, tracks: list) -> discord.Embed:
@@ -978,6 +994,97 @@ def panel_embed(user: discord.abc.User, selected: Optional[str]) -> discord.Embe
     embed = discord.Embed(title=f"🎛️ {user.display_name}'s playlists", description=desc, color=ACCENT)
     embed.set_footer(text=f"Selected: {selected}" if selected else "Pick a playlist below, then choose an action")
     return embed
+
+
+class AddSongModal(discord.ui.Modal, title="Add a song"):
+    query = discord.ui.TextInput(label="Song name or link", placeholder="song name — or a YouTube/Spotify link", max_length=300)
+
+    def __init__(self, name: str):
+        super().__init__()
+        self.playlist_name = name
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        pls = user_playlists(interaction.user)
+        if self.playlist_name not in pls:
+            await interaction.followup.send(f"Playlist **{self.playlist_name}** no longer exists.")
+            return
+        try:
+            tracks, _ = await resolve_query(str(self.query), interaction.user.display_name)
+        except RuntimeError as e:
+            await interaction.followup.send(str(e))
+            return
+        except Exception:
+            log.exception("resolve_query failed in AddSongModal")
+            await interaction.followup.send("Something went wrong finding that — try a different link or search.")
+            return
+        space = MAX_PLAYLIST_TRACKS - len(pls[self.playlist_name])
+        if space <= 0:
+            await interaction.followup.send(f"**{self.playlist_name}** is full ({MAX_PLAYLIST_TRACKS} songs).")
+            return
+        added = tracks[:space]
+        pls[self.playlist_name].extend(track_to_dict(t) for t in added)
+        await bot.save_playlists()
+        what = f"**{added[0].title}**" if len(added) == 1 else f"**{len(added)}** songs"
+        await interaction.followup.send(f"➕ Added {what} to **{self.playlist_name}** ({len(pls[self.playlist_name])} songs).")
+
+
+class SaveQueueModal(discord.ui.Modal, title="Save queue as playlist"):
+    name = discord.ui.TextInput(label="Playlist name", max_length=60)
+
+    def __init__(self, panel: "PlaylistPanel"):
+        super().__init__()
+        self.panel = panel
+
+    async def on_submit(self, interaction: discord.Interaction):
+        nm = str(self.name).strip()
+        player = bot.get_player(interaction.guild)
+        tracks = ([player.current] if player.current else []) + list(player.queue)
+        if not tracks:
+            await interaction.response.send_message("Nothing is playing or queued to save.", ephemeral=True)
+            return
+        pls = user_playlists(interaction.user)
+        if nm in pls:
+            await interaction.response.send_message(f"You already have a playlist called **{nm}**.", ephemeral=True)
+            return
+        if len(pls) >= MAX_SAVED_PLAYLISTS:
+            await interaction.response.send_message(f"Limit of {MAX_SAVED_PLAYLISTS} playlists reached — delete one first.", ephemeral=True)
+            return
+        pls[nm] = [track_to_dict(t) for t in tracks[:MAX_PLAYLIST_TRACKS]]
+        await bot.save_playlists()
+        self.panel.selected = nm
+        self.panel.rebuild_select(interaction.user)
+        await interaction.response.edit_message(embed=panel_embed(interaction.user, nm), view=self.panel)
+
+
+class RemoveSongModal(discord.ui.Modal, title="Remove a song"):
+    position = discord.ui.TextInput(label="Song number (check the Songs list)", max_length=4)
+
+    def __init__(self, name: str):
+        super().__init__()
+        self.playlist_name = name
+
+    async def on_submit(self, interaction: discord.Interaction):
+        pls = user_playlists(interaction.user)
+        tracks = pls.get(self.playlist_name)
+        if not tracks:
+            await interaction.response.send_message(f"Playlist **{self.playlist_name}** is empty or missing.", ephemeral=True)
+            return
+        try:
+            pos = int(str(self.position).strip())
+        except ValueError:
+            await interaction.response.send_message("That's not a number.", ephemeral=True)
+            return
+        if not 1 <= pos <= len(tracks):
+            await interaction.response.send_message(f"Pick a number between 1 and {len(tracks)}.", ephemeral=True)
+            return
+        removed = tracks.pop(pos - 1)
+        await bot.save_playlists()
+        await interaction.response.send_message(
+            f"🗑️ Removed the **song** `{removed.get('title', '?')}` from **{self.playlist_name}** "
+            f"— {len(tracks)} left. (The playlist itself is safe!)",
+            ephemeral=True,
+        )
 
 
 class NewPlaylistModal(discord.ui.Modal, title="New playlist"):
@@ -1079,6 +1186,14 @@ class PlaylistPanel(discord.ui.View):
             embed=playlist_songs_embed(name, user_playlists(interaction.user)[name]), ephemeral=True
         )
 
+    @discord.ui.button(label="Add song", emoji="🎵", style=discord.ButtonStyle.secondary, row=2)
+    async def add_song_btn(self, interaction: discord.Interaction, _):
+        name = self._picked()
+        if not name:
+            await interaction.response.send_message("Pick a playlist in the dropdown first.", ephemeral=True)
+            return
+        await interaction.response.send_modal(AddSongModal(name))
+
     @discord.ui.button(label="Add current song", emoji="➕", style=discord.ButtonStyle.secondary, row=2)
     async def add_current_btn(self, interaction: discord.Interaction, _):
         name = self._picked()
@@ -1099,11 +1214,27 @@ class PlaylistPanel(discord.ui.View):
             f"➕ Added **{player.current.title}** to **{name}** ({len(pls[name])} songs).", ephemeral=True
         )
 
-    @discord.ui.button(label="New", emoji="✨", style=discord.ButtonStyle.primary, row=2)
+    @discord.ui.button(label="Save queue", emoji="💾", style=discord.ButtonStyle.secondary, row=2)
+    async def save_queue_btn(self, interaction: discord.Interaction, _):
+        player = bot.get_player(interaction.guild)
+        if not player.current and not player.queue:
+            await interaction.response.send_message("Nothing is playing or queued to save.", ephemeral=True)
+            return
+        await interaction.response.send_modal(SaveQueueModal(self))
+
+    @discord.ui.button(label="New", emoji="✨", style=discord.ButtonStyle.primary, row=3)
     async def new_btn(self, interaction: discord.Interaction, _):
         await interaction.response.send_modal(NewPlaylistModal(self))
 
-    @discord.ui.button(label="Delete", emoji="🗑️", style=discord.ButtonStyle.danger, row=2)
+    @discord.ui.button(label="Remove song", emoji="➖", style=discord.ButtonStyle.secondary, row=3)
+    async def remove_song_btn(self, interaction: discord.Interaction, _):
+        name = self._picked()
+        if not name:
+            await interaction.response.send_message("Pick a playlist in the dropdown first.", ephemeral=True)
+            return
+        await interaction.response.send_modal(RemoveSongModal(name))
+
+    @discord.ui.button(label="Delete", emoji="🗑️", style=discord.ButtonStyle.danger, row=3)
     async def delete_btn(self, interaction: discord.Interaction, _):
         name = self._picked()
         if not name:
@@ -1117,157 +1248,14 @@ class PlaylistPanel(discord.ui.View):
         )
 
 
-@playlist_group.command(name="menu", description="Open your interactive playlist panel")
-async def pl_menu(interaction: discord.Interaction):
+@bot.tree.command(name="playlists", description="Your playlists — create, play, and manage them in one panel")
+async def playlists_cmd(interaction: discord.Interaction):
     view = PlaylistPanel(interaction.user)
     await interaction.response.send_message(embed=panel_embed(interaction.user, None), view=view, ephemeral=True)
     try:
         view.message = await interaction.original_response()
     except discord.HTTPException:
         pass
-
-
-@playlist_group.command(name="create", description="Create a new empty playlist")
-@app_commands.describe(name="Name for the new playlist")
-async def pl_create(interaction: discord.Interaction, name: app_commands.Range[str, 1, 60]):
-    name = name.strip()
-    pls = user_playlists(interaction.user)
-    if name in pls:
-        await interaction.response.send_message(f"You already have a playlist called **{name}**.")
-        return
-    if len(pls) >= MAX_SAVED_PLAYLISTS:
-        await interaction.response.send_message(f"You've hit the limit of {MAX_SAVED_PLAYLISTS} playlists — delete one first.")
-        return
-    pls[name] = []
-    await bot.save_playlists()
-    await interaction.response.send_message(f"🎶 Created playlist **{name}**. Add songs with `/playlist add`.")
-
-
-@playlist_group.command(name="add", description="Add a song (or a whole playlist link) to one of your playlists")
-@app_commands.describe(name="Your playlist", query="Link or search query to add")
-@app_commands.autocomplete(name=playlist_name_autocomplete)
-async def pl_add(interaction: discord.Interaction, name: str, query: str):
-    await interaction.response.defer()
-    pls = user_playlists(interaction.user)
-    if name not in pls:
-        await interaction.followup.send(f"You don't have a playlist called **{name}**. Create it with `/playlist create`.")
-        return
-    try:
-        tracks, _ = await resolve_query(query, interaction.user.display_name)
-    except RuntimeError as e:
-        await interaction.followup.send(str(e))
-        return
-    except Exception:
-        log.exception("resolve_query failed in /playlist add")
-        await interaction.followup.send("Something went wrong finding that — try a different link or search.")
-        return
-    space = MAX_PLAYLIST_TRACKS - len(pls[name])
-    if space <= 0:
-        await interaction.followup.send(f"**{name}** is full ({MAX_PLAYLIST_TRACKS} tracks).")
-        return
-    added = tracks[:space]
-    pls[name].extend(track_to_dict(t) for t in added)
-    await bot.save_playlists()
-    if len(added) == 1:
-        await interaction.followup.send(f"➕ Added **{added[0].title}** to **{name}** ({len(pls[name])} tracks).")
-    else:
-        await interaction.followup.send(f"➕ Added **{len(added)}** tracks to **{name}** ({len(pls[name])} total).")
-
-
-@playlist_group.command(name="play", description="Queue up one of your saved playlists")
-@app_commands.describe(name="Your playlist", shuffled="Shuffle it before queueing")
-@app_commands.autocomplete(name=playlist_name_autocomplete)
-async def pl_play(interaction: discord.Interaction, name: str, shuffled: bool = False):
-    await interaction.response.defer()
-    pls = user_playlists(interaction.user)
-    if name not in pls:
-        await interaction.followup.send(f"You don't have a playlist called **{name}**.")
-        return
-    if not pls[name]:
-        await interaction.followup.send(f"**{name}** is empty — add songs with `/playlist add`.")
-        return
-    await queue_saved_playlist(interaction, name, shuffled)
-
-
-@playlist_group.command(name="save", description="Save the current queue (including the playing song) as a playlist")
-@app_commands.describe(name="Name for the new playlist")
-async def pl_save(interaction: discord.Interaction, name: app_commands.Range[str, 1, 60]):
-    name = name.strip()
-    player = bot.get_player(interaction.guild)
-    tracks = ([player.current] if player.current else []) + list(player.queue)
-    if not tracks:
-        await interaction.response.send_message("Nothing is playing or queued to save.")
-        return
-    pls = user_playlists(interaction.user)
-    if name in pls:
-        await interaction.response.send_message(f"You already have a playlist called **{name}** — pick another name.")
-        return
-    if len(pls) >= MAX_SAVED_PLAYLISTS:
-        await interaction.response.send_message(f"You've hit the limit of {MAX_SAVED_PLAYLISTS} playlists — delete one first.")
-        return
-    pls[name] = [track_to_dict(t) for t in tracks[:MAX_PLAYLIST_TRACKS]]
-    await bot.save_playlists()
-    await interaction.response.send_message(f"💾 Saved **{len(pls[name])}** tracks as playlist **{name}**.")
-
-
-@playlist_group.command(name="list", description="List your saved playlists")
-async def pl_list(interaction: discord.Interaction):
-    pls = bot.playlists.get(str(interaction.user.id), {})
-    if not pls:
-        await interaction.response.send_message("You have no playlists yet. Start with `/playlist create`.")
-        return
-    lines = [f"• **{n}** — {len(ts)} track{'s' if len(ts) != 1 else ''}" for n, ts in pls.items()]
-    embed = discord.Embed(title=f"{interaction.user.display_name}'s playlists",
-                          description="\n".join(lines), color=ACCENT)
-    await interaction.response.send_message(embed=embed)
-
-
-@playlist_group.command(name="show", description="Show the songs in one of your playlists")
-@app_commands.describe(name="Your playlist")
-@app_commands.autocomplete(name=playlist_name_autocomplete)
-async def pl_show(interaction: discord.Interaction, name: str):
-    pls = user_playlists(interaction.user)
-    if name not in pls:
-        await interaction.response.send_message(f"You don't have a playlist called **{name}**.")
-        return
-    await interaction.response.send_message(embed=playlist_songs_embed(name, pls[name]))
-
-
-@playlist_group.command(name="remove", description="Remove one song from a playlist by its position")
-@app_commands.describe(name="Your playlist", position="Position shown in /playlist show")
-@app_commands.autocomplete(name=playlist_name_autocomplete)
-async def pl_remove(interaction: discord.Interaction, name: str, position: app_commands.Range[int, 1, None]):
-    pls = user_playlists(interaction.user)
-    if name not in pls:
-        await interaction.response.send_message(f"You don't have a playlist called **{name}**.")
-        return
-    if position > len(pls[name]):
-        await interaction.response.send_message("No song at that position.")
-        return
-    removed = pls[name].pop(position - 1)
-    await bot.save_playlists()
-    await interaction.response.send_message(
-        f"🗑️ Removed the **song** `{removed.get('title', '?')}` from your playlist **{name}** "
-        f"— {len(pls[name])} song{'s' if len(pls[name]) != 1 else ''} left. (The playlist itself is safe!)"
-    )
-
-
-@playlist_group.command(name="delete", description="Delete one of your playlists entirely")
-@app_commands.describe(name="Your playlist")
-@app_commands.autocomplete(name=playlist_name_autocomplete)
-async def pl_delete(interaction: discord.Interaction, name: str):
-    pls = user_playlists(interaction.user)
-    if name not in pls:
-        await interaction.response.send_message(f"You don't have a playlist called **{name}**.", ephemeral=True)
-        return
-    await interaction.response.send_message(
-        f"Really delete playlist **{name}** and its **{len(pls[name])}** songs? This can't be undone.",
-        view=ConfirmDeletePlaylist(interaction.user.id, name),
-        ephemeral=True,
-    )
-
-
-bot.tree.add_command(playlist_group)
 
 
 if __name__ == "__main__":

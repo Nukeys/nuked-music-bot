@@ -34,15 +34,17 @@ async def main():
         info = [e for e in info["entries"] if e][0]
     stream = info["url"]
     print(f"[4] stream url    -> {info['title']!r}, url length {len(stream)}")
-    proc = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error",
-         "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
-         "-i", stream, "-t", "3", "-vn", "-f", "s16le", "-ar", "48000", "-ac", "2", "-"],
-        capture_output=True, timeout=60)
-    pcm_bytes = len(proc.stdout)
-    expected = 48000 * 2 * 2 * 3  # 3s of 48kHz stereo s16
-    print(f"[4] ffmpeg decode -> {pcm_bytes} PCM bytes (expected ~{expected})")
-    if pcm_bytes < expected * 0.9:
+    headers = info.get("http_headers") or {}
+    hdr = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
+    if hdr:
+        cmd += ["-headers", hdr]
+    cmd += ["-i", stream, "-t", "3", "-vn", "-af", "volume=0.3",
+            "-c:a", "libopus", "-b:a", "96k", "-compression_level", "5", "-f", "opus", "-"]
+    proc = subprocess.run(cmd, capture_output=True, timeout=60)
+    opus_bytes = len(proc.stdout)
+    print(f"[4] ffmpeg encode -> {opus_bytes} opus bytes (expect >5000)")
+    if opus_bytes < 5000:
         ok = False
         print(f"    FFmpeg stderr: {proc.stderr.decode(errors='replace')[:500]}")
 
