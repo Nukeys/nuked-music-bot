@@ -132,11 +132,13 @@ def make_source(stream_url: str, info: dict, volume_pct: int, seek: float = 0.0)
     if seek > 0:
         before = f"-ss {seek:.2f} " + before
     opts = f"-vn -af volume={volume_amp(volume_pct):.4f} -compression_level 5"
+    # NOTE: do not pass codec= here — discord.py treats codec="libopus" as "the
+    # source is already opus, just copy it", which conflicts with the volume
+    # filter and kills ffmpeg instantly. Default (None) means encode with libopus.
     return discord.FFmpegOpusAudio(
         stream_url,
         executable=FFMPEG_EXE,
         bitrate=96,
-        codec="libopus",
         before_options=before,
         options=opts,
         stderr=FFMPEG_LOG,
@@ -626,9 +628,18 @@ class MusicControls(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        log.info(
+            "Button %s pressed by %s (gateway latency %.2fs)",
+            (interaction.data or {}).get("custom_id", "?"), interaction.user, bot.latency,
+        )
+        return True
+
     async def on_error(self, interaction: discord.Interaction, error: Exception, item):
         if isinstance(error, discord.NotFound):
-            return  # interaction expired (bot was busy or restarting mid-click) — nothing useful to do
+            # interaction expired before our ACK arrived — log it so we can see how often
+            log.warning("Button %s ACK arrived too late (interaction expired)", getattr(item, "custom_id", "?"))
+            return
         log.error("Button %s failed", getattr(item, "custom_id", "?"), exc_info=error)
         try:
             if not interaction.response.is_done():
