@@ -1,0 +1,15 @@
+[Unit]
+Description=Nuked Music Discord bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/discord-music-bot
+ExecStart=/home/ubuntu/discord-music-bot/.venv/bin/python bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

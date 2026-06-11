@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+*.log
+.botchunk*.txt
+ffmpeg
+playlists.json
+.ffmpeg_tmp/
