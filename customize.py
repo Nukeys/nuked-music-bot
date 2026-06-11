@@ -20,11 +20,11 @@ API = "https://discord.com/api/v10"
 HEADERS = {"Authorization": f"Bot {TOKEN}"}
 
 DESCRIPTION = (
-    "music bot for the server. throw it a youtube, spotify or soundcloud link, "
-    "or just type the song name and it'll find it.\n\n"
-    "/play - play something\n"
-    "/playlists - your saved playlists\n\n"
-    "everything else is buttons. made for nuked community"
+    "Music for your server. Paste a YouTube, Spotify, or SoundCloud link, "
+    "or just type a song name and it'll find it.\n\n"
+    "/play — play a song, album, or playlist\n"
+    "/playlists — create and manage your saved playlists\n\n"
+    "Full button controls on every track. Built for Nuked Community."
 )
 TAGS = ["music", "youtube", "spotify", "playlists", "soundcloud"]
 

@@ -469,9 +469,22 @@ async def player_loop(player: GuildPlayer):
             player.task = None
             return
 
-        # fresh stream URL at play time (stored URLs expire)
+        # fresh stream URL at play time (stored URLs expire). YouTube's bot
+        # checks on datacenter IPs are intermittent, so failed extractions get
+        # a couple of retries before we give up on the track.
         try:
-            info = await ytdl_extract(YTDL_PLAY_OPTS, track.query)
+            info = None
+            last_err = None
+            for attempt in range(3):
+                try:
+                    info = await ytdl_extract(YTDL_PLAY_OPTS, track.query)
+                    break
+                except Exception as e:
+                    last_err = e
+                    if "Sign in to confirm" not in str(e) or attempt == 2:
+                        raise
+                    log.info("Bot-check on attempt %d for %r, retrying…", attempt + 1, track.title)
+                    await asyncio.sleep(1.5)
             if info and "entries" in info:
                 entries = [e for e in info["entries"] if e]
                 info = entries[0] if entries else None
@@ -741,8 +754,8 @@ async def ensure_voice(interaction: discord.Interaction) -> Optional[discord.Voi
     return vc
 
 
-@bot.tree.command(description="Play a song from a link (YouTube/Spotify/SoundCloud/...) or a search query")
-@app_commands.describe(query="A link or something to search for")
+@bot.tree.command(description="Play music from a link or search — YouTube, Spotify, SoundCloud, and more")
+@app_commands.describe(query="Song name or link")
 async def play(interaction: discord.Interaction, query: str):
     await interaction.response.defer()
     vc = await ensure_voice(interaction)
@@ -814,18 +827,18 @@ async def resume(interaction: discord.Interaction):
         await interaction.response.send_message("Nothing is paused.")
 
 
-@bot.tree.command(description="Stop playback, clear the queue, and leave the voice channel")
+@bot.tree.command(description="Stop playback, clear the queue, and disconnect")
 async def stop(interaction: discord.Interaction):
     await do_stop(interaction.guild)
     await interaction.response.send_message("⏹️ Stopped and left the voice channel.")
 
 
-@bot.tree.command(description="Show the queue")
+@bot.tree.command(description="View the current queue")
 async def queue(interaction: discord.Interaction):
     await interaction.response.send_message(embed=queue_embed(bot.get_player(interaction.guild)))
 
 
-@bot.tree.command(name="nowplaying", description="Show the current song")
+@bot.tree.command(name="nowplaying", description="Show the current song and playback controls")
 async def nowplaying(interaction: discord.Interaction):
     player = bot.get_player(interaction.guild)
     if not player.current:
@@ -846,7 +859,7 @@ async def shuffle(interaction: discord.Interaction):
     await interaction.response.send_message(f"🔀 Shuffled {len(q)} tracks.")
 
 
-@bot.tree.command(description="Set loop mode")
+@bot.tree.command(description="Loop the current song or the entire queue")
 @app_commands.describe(mode="off, track, or queue")
 @app_commands.choices(mode=[
     app_commands.Choice(name="off", value="off"),
@@ -898,7 +911,7 @@ async def clear(interaction: discord.Interaction):
 
 
 # --------------------------------------------------------------------------
-# Saved playlists (/playlist ...)
+# Saved playlists (/playlists panel)
 # --------------------------------------------------------------------------
 
 def user_playlists(user: discord.abc.User) -> dict:
@@ -1135,7 +1148,7 @@ class PlaylistPanel(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
             await interaction.response.send_message(
-                "This panel belongs to someone else — open yours with `/playlist menu`.", ephemeral=True
+                "This panel belongs to someone else — open yours with `/playlists`.", ephemeral=True
             )
             return False
         return True
@@ -1248,7 +1261,7 @@ class PlaylistPanel(discord.ui.View):
         )
 
 
-@bot.tree.command(name="playlists", description="Your playlists — create, play, and manage them in one panel")
+@bot.tree.command(name="playlists", description="Create, play, and manage your saved playlists")
 async def playlists_cmd(interaction: discord.Interaction):
     view = PlaylistPanel(interaction.user)
     await interaction.response.send_message(embed=panel_embed(interaction.user, None), view=view, ephemeral=True)
