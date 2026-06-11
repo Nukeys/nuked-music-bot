@@ -97,6 +97,17 @@ YTDL_QUEUE_OPTS = {
     "extractor_args": _YT_CLIENTS,
 }
 
+# YouTube cookies make requests look like a logged-in user, which bypasses the
+# bot checks that datacenter IPs trigger. Supply via Render Secret File
+# (cookies.txt) or the YT_COOKIES_FILE env var. Use a throwaway account.
+_COOKIES = os.getenv("YT_COOKIES_FILE") or (
+    "/etc/secrets/cookies.txt" if os.path.exists("/etc/secrets/cookies.txt") else None
+)
+if _COOKIES:
+    YTDL_PLAY_OPTS["cookiefile"] = _COOKIES
+    YTDL_QUEUE_OPTS["cookiefile"] = _COOKIES
+    log.info("YouTube cookies loaded from %s", _COOKIES)
+
 FFMPEG_BEFORE = "-loglevel error -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin"
 FFMPEG_OPTS = "-vn"
 
