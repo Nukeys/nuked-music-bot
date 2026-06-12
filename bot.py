@@ -69,10 +69,18 @@ SPOTIFY_URL_RE = re.compile(
 )
 URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
-# The android client dodges YouTube's "Sign in to confirm you're not a bot"
-# checks that datacenter IPs (Render, etc.) trigger on the web client; web is
-# kept as the primary for when it works. (tv/web_safari no longer give URLs.)
-_YT_CLIENTS = {"youtube": {"player_client": ["web", "android"]}}
+# YouTube on datacenter IPs (Render) needs three things to serve clean audio:
+#   1. cookies (below) to pass the "confirm you're not a bot" check
+#   2. the `tv` client, which returns audio-only opus formats when cookied
+#      (web only yields a flaky combined 360p format; android rejects cookies)
+#   3. Deno on PATH so yt-dlp can solve the JS signature ("nsig") challenge
+# web is kept as a fallback for the rare video tv won't serve.
+_YT_CLIENTS = {"youtube": {"player_client": ["tv", "web"]}}
+
+# Make a bundled/installed Deno discoverable to yt-dlp's signature solver.
+for _deno_dir in ("/usr/local/bin", os.path.join(_BOT_DIR, ".deno", "bin")):
+    if os.path.isdir(_deno_dir) and _deno_dir not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = _deno_dir + os.pathsep + os.environ.get("PATH", "")
 
 YTDL_PLAY_OPTS = {
     "format": "bestaudio[acodec!=none]/bestaudio/best",

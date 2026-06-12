@@ -1,5 +1,6 @@
 discord.py[voice]>=2.7.1
-yt-dlp>=2026.6.9
+yt-dlp[default]>=2026.6.9
+yt-dlp-ejs>=0.8.0
 python-dotenv>=1.0.0
 spotipy>=2.25.0
 aiohttp>=3.12.0
