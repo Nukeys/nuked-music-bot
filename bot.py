@@ -208,6 +208,7 @@ class Track:
     # song was playing). Stream URLs go stale, so it expires after PREFETCH_TTL.
     prefetched: Optional[dict] = None
     prefetched_at: float = 0.0
+    prefetch_task: Optional[asyncio.Task] = None
 
 
 PREFETCH_TTL = 600  # seconds a prefetched stream URL is trusted before re-extracting
@@ -389,28 +390,65 @@ async def warm_ytdlp():
         log.info("yt-dlp warm-up failed (harmless): %s", e)
 
 
+# One extraction at a time, across all guilds: every yt-dlp run spawns a Deno
+# process for YouTube's JS challenge, and two of those at once is exactly how
+# the 512MB instance got OOM-killed (Render events, 2026-06-12). On 0.1 CPU,
+# serializing is also no slower in wall-clock time than letting them compete.
+_EXTRACT_GATE = asyncio.Semaphore(1)
+
+
 async def ytdl_extract(opts: dict, query: str) -> dict:
     loop = asyncio.get_running_loop()
     def _run():
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(query, download=False)
-    return await loop.run_in_executor(None, _run)
+    async with _EXTRACT_GATE:
+        return await loop.run_in_executor(None, _run)
+
+
+# Everything playback/embeds actually use — the rest of a yt-dlp result (the
+# formats list above all) is hundreds of KB we'd otherwise keep per track.
+_INFO_KEEP = ("id", "url", "title", "duration", "webpage_url", "thumbnail",
+              "protocol", "acodec", "abr", "http_headers", "is_live")
+
+
+def _slim_info(info: dict) -> dict:
+    return {k: info[k] for k in _INFO_KEEP if k in info}
+
+
+# Replays of recent songs (queue loop, a favourite on repeat) skip YouTube
+# entirely. Stream URLs live ~6 hours; stay comfortably inside that.
+_STREAM_CACHE: dict[str, tuple[float, dict]] = {}
+_STREAM_CACHE_TTL = 5400
+_STREAM_CACHE_MAX = 64
 
 
 async def extract_play(query: str) -> Optional[dict]:
     """Play-time extraction: fast path first (tv client only, no watch-page
     download), full tv+web pass as a safety net for whatever the fast path
     can't serve. Bot-check errors propagate so callers can back off and retry."""
+    cached = _STREAM_CACHE.get(query)
+    if cached and time.monotonic() - cached[0] < _STREAM_CACHE_TTL:
+        return cached[1]
+    info = None
     try:
         info = _first_entry(await ytdl_extract(YTDL_PLAY_OPTS, query))
-        if info and info.get("url"):
-            return info
-        log.info("Fast extraction gave no stream for %r — retrying with web fallback", query)
+        if not (info and info.get("url")):
+            log.info("Fast extraction gave no stream for %r — retrying with web fallback", query)
+            info = None
     except Exception as e:
         if "Sign in to confirm" in str(e):
             raise
         log.info("Fast extraction failed for %r (%s) — retrying with web fallback", query, e)
-    return _first_entry(await ytdl_extract(YTDL_PLAY_FALLBACK_OPTS, query))
+    if info is None:
+        info = _first_entry(await ytdl_extract(YTDL_PLAY_FALLBACK_OPTS, query))
+    if info and info.get("url"):
+        info = _slim_info(info)
+        if not info.get("is_live"):
+            _STREAM_CACHE[query] = (time.monotonic(), info)
+            while len(_STREAM_CACHE) > _STREAM_CACHE_MAX:
+                _STREAM_CACHE.pop(next(iter(_STREAM_CACHE)))
+    return info
 
 
 async def resolve_spotify(url: str, requester: str) -> tuple[list[Track], str]:
@@ -580,6 +618,14 @@ async def player_loop(player: GuildPlayer):
         # a couple of retries before we give up on the track.
         started = time.monotonic()
         try:
+            if track.prefetch_task and not track.prefetch_task.done():
+                # a background resolve is already in flight — wait for it
+                # instead of racing it with a second extraction
+                try:
+                    await asyncio.wait_for(asyncio.shield(track.prefetch_task), timeout=60)
+                except asyncio.TimeoutError:
+                    pass
+            track.prefetch_task = None
             info = None
             if track.prefetched and time.monotonic() - track.prefetched_at < PREFETCH_TTL:
                 info = track.prefetched  # resolved during /play or the previous song
@@ -642,8 +688,8 @@ async def player_loop(player: GuildPlayer):
 
         # Resolve the next song's stream while this one plays, so the gap
         # between tracks is near-zero instead of a full extraction.
-        if player.queue and not player.queue[0].prefetched:
-            asyncio.ensure_future(prefetch_track(player.queue[0]))
+        if player.queue:
+            ensure_prefetch(player.queue[0])
 
         await player.next_event.wait()
 
@@ -658,6 +704,13 @@ async def prefetch_track(track: Track):
             track.prefetched_at = time.monotonic()
     except Exception as e:
         log.debug("Prefetch failed for %r: %s", track.title, e)
+
+
+def ensure_prefetch(track: Track):
+    """Kick off a background resolve for a track, at most one per track."""
+    if track.prefetched or (track.prefetch_task and not track.prefetch_task.done()):
+        return
+    track.prefetch_task = asyncio.ensure_future(prefetch_track(track))
 
 
 def ensure_player_task(player: GuildPlayer):
@@ -769,15 +822,17 @@ class MusicControls(discord.ui.View):
         except discord.HTTPException:
             pass
 
+    # State-changing actions reply publicly with the presser's name — everyone
+    # in the channel should see WHO paused/skipped/stopped, not just the presser.
     @discord.ui.button(label="Pause", emoji="⏯️", style=discord.ButtonStyle.secondary, custom_id="music:toggle", row=0)
     async def toggle(self, interaction: discord.Interaction, _):
         vc = interaction.guild.voice_client
         if vc and vc.is_playing():
             vc.pause()
-            await interaction.response.send_message("⏸️ Paused.", ephemeral=True)
+            await interaction.response.send_message(f"⏸️ **{interaction.user.display_name}** paused.")
         elif vc and vc.is_paused():
             vc.resume()
-            await interaction.response.send_message("▶️ Resumed.", ephemeral=True)
+            await interaction.response.send_message(f"▶️ **{interaction.user.display_name}** resumed.")
         else:
             await interaction.response.send_message("Nothing is playing.", ephemeral=True)
 
@@ -785,7 +840,7 @@ class MusicControls(discord.ui.View):
     async def skip_btn(self, interaction: discord.Interaction, _):
         vc = interaction.guild.voice_client
         if vc and (vc.is_playing() or vc.is_paused()):
-            await interaction.response.send_message("⏭️ Skipped.", ephemeral=True)
+            await interaction.response.send_message(f"⏭️ **{interaction.user.display_name}** skipped.")
             player = bot.get_player(interaction.guild)
             if player.loop_mode == "track":
                 player.loop_mode = "off"
@@ -795,7 +850,9 @@ class MusicControls(discord.ui.View):
 
     @discord.ui.button(label="Stop", emoji="⏹️", style=discord.ButtonStyle.danger, custom_id="music:stop", row=0)
     async def stop_btn(self, interaction: discord.Interaction, _):
-        await interaction.response.send_message("⏹️ Stopped and left the voice channel.", ephemeral=True)
+        await interaction.response.send_message(
+            f"⏹️ **{interaction.user.display_name}** stopped the music — leaving the voice channel."
+        )
         await do_stop(interaction.guild)
 
     @discord.ui.button(label="Queue", emoji="📜", style=discord.ButtonStyle.secondary, custom_id="music:queue", row=1)
@@ -813,14 +870,19 @@ class MusicControls(discord.ui.View):
         q = list(player.queue)
         random.shuffle(q)
         player.queue = deque(q)
-        await interaction.response.send_message(f"🔀 Shuffled {len(q)} tracks.", ephemeral=True)
+        ensure_prefetch(player.queue[0])  # the old prefetched track is likely elsewhere now
+        await interaction.response.send_message(
+            f"🔀 **{interaction.user.display_name}** shuffled {len(q)} tracks."
+        )
 
     @discord.ui.button(label="Loop", emoji="🔁", style=discord.ButtonStyle.secondary, custom_id="music:loop", row=1)
     async def loop_btn(self, interaction: discord.Interaction, _):
         player = bot.get_player(interaction.guild)
         player.loop_mode = {"off": "track", "track": "queue", "queue": "off"}[player.loop_mode]
         badge = {"off": "➡️ Loop off", "track": "🔂 Looping this track", "queue": "🔁 Looping the queue"}
-        await interaction.response.send_message(badge[player.loop_mode], ephemeral=True)
+        await interaction.response.send_message(
+            f"{badge[player.loop_mode]} — **{interaction.user.display_name}**"
+        )
 
 # Created in setup_hook, NOT here: a View instantiated before the event loop
 # exists has no internal "stopped" future, and discord.py 2.7 silently discards
@@ -921,6 +983,8 @@ async def play(interaction: discord.Interaction, query: str):
     player.queue.extend(tracks)
     player.queue_event.set()
     ensure_player_task(player)
+    if player.current and player.queue:
+        ensure_prefetch(player.queue[0])  # so a skip right now lands instantly
 
     if len(tracks) == 1:
         t = tracks[0]
@@ -998,6 +1062,7 @@ async def shuffle(interaction: discord.Interaction):
     q = list(player.queue)
     random.shuffle(q)
     player.queue = deque(q)
+    ensure_prefetch(player.queue[0])  # the old prefetched track is likely elsewhere now
     await interaction.response.send_message(f"🔀 Shuffled {len(q)} tracks.")
 
 
@@ -1100,6 +1165,8 @@ async def queue_saved_playlist(interaction: discord.Interaction, name: str, shuf
     player.queue.extend(tracks)
     player.queue_event.set()
     ensure_player_task(player)
+    if player.current and player.queue:
+        ensure_prefetch(player.queue[0])
     await interaction.followup.send(
         embed=discord.Embed(
             description=f"▶️ Queued **{len(tracks)}** songs from playlist **{name}**" + (" 🔀" if shuffled else ""),
