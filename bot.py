@@ -18,6 +18,7 @@ import os
 import random
 import re
 import sys
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
@@ -74,8 +75,11 @@ URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 #   2. the `tv` client, which returns audio-only opus formats when cookied
 #      (web only yields a flaky combined 360p format; android rejects cookies)
 #   3. Deno on PATH so yt-dlp can solve the JS signature ("nsig") challenge
-# web is kept as a fallback for the rare video tv won't serve.
-_YT_CLIENTS = {"youtube": {"player_client": ["tv", "web"]}}
+# Fast path queries ONLY tv and skips the ~1.5MB watch-page download — both are
+# mostly CPU-bound parsing, which is what hurts on a 0.1-CPU host. extract_play()
+# falls back to the full tv+web pass for the rare video the fast path can't serve.
+_YT_CLIENTS = {"youtube": {"player_client": ["tv"], "player_skip": ["webpage"]}}
+_YT_CLIENTS_FALLBACK = {"youtube": {"player_client": ["tv", "web"]}}
 
 # Make a bundled/installed Deno discoverable to yt-dlp's signature solver.
 for _deno_dir in ("/usr/local/bin", os.path.join(_BOT_DIR, ".deno", "bin")):
@@ -93,6 +97,8 @@ YTDL_PLAY_OPTS = {
     "extractor_args": _YT_CLIENTS,
 }
 
+YTDL_PLAY_FALLBACK_OPTS = {**YTDL_PLAY_OPTS, "extractor_args": _YT_CLIENTS_FALLBACK}
+
 YTDL_QUEUE_OPTS = {
     "format": "bestaudio/best",
     "quiet": True,
@@ -102,7 +108,8 @@ YTDL_QUEUE_OPTS = {
     "source_address": "0.0.0.0",
     "skip_download": True,
     "playlistend": MAX_PLAYLIST_TRACKS,
-    "extractor_args": _YT_CLIENTS,
+    # full args here: playlist listing needs the regular webpage path
+    "extractor_args": _YT_CLIENTS_FALLBACK,
 }
 
 # YouTube cookies make requests look like a logged-in user, which bypasses the
@@ -121,6 +128,7 @@ if _COOKIES_SRC and os.path.exists(_COOKIES_SRC):
     except OSError:
         _COOKIES = _COOKIES_SRC  # fall back to in-place (writable host)
     YTDL_PLAY_OPTS["cookiefile"] = _COOKIES
+    YTDL_PLAY_FALLBACK_OPTS["cookiefile"] = _COOKIES
     YTDL_QUEUE_OPTS["cookiefile"] = _COOKIES
     log.info("YouTube cookies loaded from %s (working copy: %s)", _COOKIES_SRC, _COOKIES)
 
@@ -196,6 +204,13 @@ class Track:
     duration: Optional[float] = None
     webpage_url: Optional[str] = None
     thumbnail: Optional[str] = None
+    # Full yt-dlp info resolved ahead of time (at /play, or while the previous
+    # song was playing). Stream URLs go stale, so it expires after PREFETCH_TTL.
+    prefetched: Optional[dict] = None
+    prefetched_at: float = 0.0
+
+
+PREFETCH_TTL = 600  # seconds a prefetched stream URL is trusted before re-extracting
 
 
 @dataclass
@@ -247,6 +262,7 @@ class MusicBot(commands.Bot):
         CONTROLS = MusicControls()
         self.add_view(CONTROLS)  # persistent: buttons keep working after restarts
         self.loop.create_task(start_keepalive())
+        self.loop.create_task(warm_ytdlp())
         await self.tree.sync()  # global sync (can take up to an hour to propagate the first time)
 
     async def on_ready(self):
@@ -361,12 +377,40 @@ async def start_keepalive():
 # Track resolution
 # --------------------------------------------------------------------------
 
+async def warm_ytdlp():
+    """First extraction after a deploy pays one-time costs (YouTube player JS
+    download + Deno signature solve, cached afterwards) — several seconds on a
+    0.1-CPU host. Pay them at boot so the first /play doesn't."""
+    try:
+        t0 = time.monotonic()
+        await ytdl_extract(YTDL_PLAY_OPTS, "https://www.youtube.com/watch?v=jNQXAC9IVRw")
+        log.info("yt-dlp warmed up in %.1fs", time.monotonic() - t0)
+    except Exception as e:
+        log.info("yt-dlp warm-up failed (harmless): %s", e)
+
+
 async def ytdl_extract(opts: dict, query: str) -> dict:
     loop = asyncio.get_running_loop()
     def _run():
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(query, download=False)
     return await loop.run_in_executor(None, _run)
+
+
+async def extract_play(query: str) -> Optional[dict]:
+    """Play-time extraction: fast path first (tv client only, no watch-page
+    download), full tv+web pass as a safety net for whatever the fast path
+    can't serve. Bot-check errors propagate so callers can back off and retry."""
+    try:
+        info = _first_entry(await ytdl_extract(YTDL_PLAY_OPTS, query))
+        if info and info.get("url"):
+            return info
+        log.info("Fast extraction gave no stream for %r — retrying with web fallback", query)
+    except Exception as e:
+        if "Sign in to confirm" in str(e):
+            raise
+        log.info("Fast extraction failed for %r (%s) — retrying with web fallback", query, e)
+    return _first_entry(await ytdl_extract(YTDL_PLAY_FALLBACK_OPTS, query))
 
 
 async def resolve_spotify(url: str, requester: str) -> tuple[list[Track], str]:
@@ -417,6 +461,18 @@ async def resolve_spotify(url: str, requester: str) -> tuple[list[Track], str]:
     return [Track(query=f"ytsearch1:{display} audio", title=display, requested_by=requester)], display
 
 
+def _first_entry(info: Optional[dict]) -> Optional[dict]:
+    """Unwrap a search/playlist result down to its first real entry."""
+    if info and "entries" in info:
+        entries = [e for e in info["entries"] if e]
+        return entries[0] if entries else None
+    return info
+
+
+def _looks_like_playlist(url: str) -> bool:
+    return "/playlist" in url or "/sets/" in url or "list=" in url
+
+
 async def resolve_query(query: str, requester: str) -> tuple[list[Track], str]:
     """Anything the user typed -> list of Tracks + description for the reply."""
     query = query.strip()
@@ -426,6 +482,27 @@ async def resolve_query(query: str, requester: str) -> tuple[list[Track], str]:
 
     if not URL_RE.match(query):
         query = f"ytsearch1:{query}"
+
+    # Single track (search or plain video link): extract fully ONCE, here, and
+    # hand the result to the player loop — instead of a metadata pass now plus a
+    # second full extraction (two player APIs + JS signature solve) at play time.
+    # On a 0.1-CPU host that duplicate pass was most of the wait before audio.
+    if query.startswith("ytsearch") or not _looks_like_playlist(query):
+        full = await extract_play(query)
+        if full is None:
+            raise RuntimeError("Nothing found for that query.")
+        track = Track(
+            query=full.get("webpage_url") or query,
+            title=full.get("title") or "Unknown title",
+            requested_by=requester,
+            duration=full.get("duration"),
+            webpage_url=full.get("webpage_url"),
+            thumbnail=full.get("thumbnail"),
+        )
+        if full.get("url"):
+            track.prefetched = full
+            track.prefetched_at = time.monotonic()
+        return [track], track.title
 
     info = await ytdl_extract(YTDL_QUEUE_OPTS, query)
     if info is None:
@@ -501,22 +578,23 @@ async def player_loop(player: GuildPlayer):
         # fresh stream URL at play time (stored URLs expire). YouTube's bot
         # checks on datacenter IPs are intermittent, so failed extractions get
         # a couple of retries before we give up on the track.
+        started = time.monotonic()
         try:
             info = None
-            last_err = None
+            if track.prefetched and time.monotonic() - track.prefetched_at < PREFETCH_TTL:
+                info = track.prefetched  # resolved during /play or the previous song
+            track.prefetched = None
             for attempt in range(3):
+                if info is not None:
+                    break
                 try:
-                    info = await ytdl_extract(YTDL_PLAY_OPTS, track.query)
+                    info = await extract_play(track.query)
                     break
                 except Exception as e:
-                    last_err = e
                     if "Sign in to confirm" not in str(e) or attempt == 2:
                         raise
                     log.info("Bot-check on attempt %d for %r, retrying…", attempt + 1, track.title)
                     await asyncio.sleep(1.5)
-            if info and "entries" in info:
-                entries = [e for e in info["entries"] if e]
-                info = entries[0] if entries else None
             if not info or not info.get("url"):
                 raise RuntimeError("no stream URL")
             track.title = info.get("title") or track.title
@@ -534,7 +612,8 @@ async def player_loop(player: GuildPlayer):
             player.current = None
             continue
 
-        log.info("Playing %r (protocol=%s, codec=%s)", track.title, info.get("protocol"), info.get("acodec"))
+        log.info("Playing %r (protocol=%s, codec=%s, resolved in %.1fs)",
+                 track.title, info.get("protocol"), info.get("acodec"), time.monotonic() - started)
         source = make_source(stream_url, info, player.volume_pct)
         player.stream_url = stream_url
         player.stream_info = info
@@ -561,7 +640,24 @@ async def player_loop(player: GuildPlayer):
             except discord.HTTPException:
                 pass
 
+        # Resolve the next song's stream while this one plays, so the gap
+        # between tracks is near-zero instead of a full extraction.
+        if player.queue and not player.queue[0].prefetched:
+            asyncio.ensure_future(prefetch_track(player.queue[0]))
+
         await player.next_event.wait()
+
+
+async def prefetch_track(track: Track):
+    """Best-effort early extraction; the player loop falls back to a normal
+    extraction if this failed or expired by the time the track comes up."""
+    try:
+        info = await extract_play(track.query)
+        if info and info.get("url"):
+            track.prefetched = info
+            track.prefetched_at = time.monotonic()
+    except Exception as e:
+        log.debug("Prefetch failed for %r: %s", track.title, e)
 
 
 def ensure_player_task(player: GuildPlayer):
@@ -798,22 +894,28 @@ async def ensure_voice(interaction: discord.Interaction) -> Optional[discord.Voi
 @app_commands.describe(query="Song name or link")
 async def play(interaction: discord.Interaction, query: str):
     await interaction.response.defer()
-    vc = await ensure_voice(interaction)
+    # Join voice and resolve the song at the same time — they don't depend on
+    # each other, and doing them back-to-back used to double the wait.
+    voice_task = asyncio.ensure_future(ensure_voice(interaction))
+
+    try:
+        tracks, desc = await resolve_query(query, interaction.user.display_name)
+    except RuntimeError as e:
+        await voice_task
+        await interaction.followup.send(str(e))
+        return
+    except Exception:
+        log.exception("resolve_query failed")
+        await voice_task
+        await interaction.followup.send("Something went wrong finding that — try a different link or search.")
+        return
+
+    vc = await voice_task
     if vc is None:
         return
 
     player = bot.get_player(interaction.guild)
     player.text_channel = interaction.channel
-
-    try:
-        tracks, desc = await resolve_query(query, interaction.user.display_name)
-    except RuntimeError as e:
-        await interaction.followup.send(str(e))
-        return
-    except Exception:
-        log.exception("resolve_query failed")
-        await interaction.followup.send("Something went wrong finding that — try a different link or search.")
-        return
 
     starting_now = player.current is None and not player.queue
     player.queue.extend(tracks)
