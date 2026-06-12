@@ -402,11 +402,16 @@ async def warm_ytdlp():
 _EXTRACT_GATE = asyncio.Semaphore(1)
 
 
-async def ytdl_extract(opts: dict, query: str) -> dict:
+async def ytdl_extract(opts: dict, query: str, gated: bool = True) -> dict:
     loop = asyncio.get_running_loop()
     def _run():
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(query, download=False)
+    if not gated:
+        # flat metadata lookups (search results, playlist listings) are one
+        # light HTTP call — no Deno, no formats — and may run alongside a
+        # heavy extraction so /play can answer while the gate is busy
+        return await loop.run_in_executor(None, _run)
     async with _EXTRACT_GATE:
         return await loop.run_in_executor(None, _run)
 
@@ -512,12 +517,13 @@ def _first_entry(info: Optional[dict]) -> Optional[dict]:
     return info
 
 
-def _looks_like_playlist(url: str) -> bool:
-    return "/playlist" in url or "/sets/" in url or "list=" in url
-
-
 async def resolve_query(query: str, requester: str) -> tuple[list[Track], str]:
-    """Anything the user typed -> list of Tracks + description for the reply."""
+    """Anything the user typed -> list of Tracks + description for the reply.
+
+    Deliberately LIGHT: one flat metadata lookup, no stream extraction — so
+    /play can answer in a couple of seconds. The heavy per-track extraction
+    (player API + JS challenge, ~10s on this host) happens in the player loop
+    and the prefetch pump after the reply is already on screen."""
     query = query.strip()
 
     if SPOTIFY_URL_RE.search(query):
@@ -526,28 +532,7 @@ async def resolve_query(query: str, requester: str) -> tuple[list[Track], str]:
     if not URL_RE.match(query):
         query = f"ytsearch1:{query}"
 
-    # Single track (search or plain video link): extract fully ONCE, here, and
-    # hand the result to the player loop — instead of a metadata pass now plus a
-    # second full extraction (two player APIs + JS signature solve) at play time.
-    # On a 0.1-CPU host that duplicate pass was most of the wait before audio.
-    if query.startswith("ytsearch") or not _looks_like_playlist(query):
-        full = await extract_play(query)
-        if full is None:
-            raise RuntimeError("Nothing found for that query.")
-        track = Track(
-            query=full.get("webpage_url") or query,
-            title=full.get("title") or "Unknown title",
-            requested_by=requester,
-            duration=full.get("duration"),
-            webpage_url=full.get("webpage_url"),
-            thumbnail=full.get("thumbnail"),
-        )
-        if full.get("url"):
-            track.prefetched = full
-            track.prefetched_at = time.monotonic()
-        return [track], track.title
-
-    info = await ytdl_extract(YTDL_QUEUE_OPTS, query)
+    info = await ytdl_extract(YTDL_QUEUE_OPTS, query, gated=False)
     if info is None:
         raise RuntimeError("Nothing found for that query.")
 
