@@ -85,6 +85,9 @@ _YT_CLIENTS_FALLBACK = {"youtube": {"player_client": ["tv", "web"]}}
 for _deno_dir in ("/usr/local/bin", os.path.join(_BOT_DIR, ".deno", "bin")):
     if os.path.isdir(_deno_dir) and _deno_dir not in os.environ.get("PATH", ""):
         os.environ["PATH"] = _deno_dir + os.pathsep + os.environ.get("PATH", "")
+# Cap the solver's V8 heap: an unbounded Deno spike helped OOM the 512MB
+# instance, and the signature challenges need nowhere near this much.
+os.environ.setdefault("DENO_V8_FLAGS", "--max-old-space-size=128")
 
 YTDL_PLAY_OPTS = {
     "format": "bestaudio[acodec!=none]/bestaudio/best",
@@ -209,9 +212,11 @@ class Track:
     prefetched: Optional[dict] = None
     prefetched_at: float = 0.0
     prefetch_task: Optional[asyncio.Task] = None
+    prefetch_failed: bool = False   # don't background-retry a dead video forever
 
 
-PREFETCH_TTL = 600  # seconds a prefetched stream URL is trusted before re-extracting
+PREFETCH_TTL = 600   # seconds a prefetched stream URL is trusted before re-extracting
+PREFETCH_AHEAD = 3   # upcoming tracks kept resolved so several quick skips land instantly
 
 
 @dataclass
@@ -686,10 +691,9 @@ async def player_loop(player: GuildPlayer):
             except discord.HTTPException:
                 pass
 
-        # Resolve the next song's stream while this one plays, so the gap
-        # between tracks is near-zero instead of a full extraction.
-        if player.queue:
-            ensure_prefetch(player.queue[0])
+        # Resolve upcoming streams while this one plays, so the gap between
+        # tracks — and a few quick skips in a row — costs no extraction wait.
+        pump_prefetch(player)
 
         await player.next_event.wait()
 
@@ -702,15 +706,32 @@ async def prefetch_track(track: Track):
         if info and info.get("url"):
             track.prefetched = info
             track.prefetched_at = time.monotonic()
+        else:
+            track.prefetch_failed = True
     except Exception as e:
+        track.prefetch_failed = True
         log.debug("Prefetch failed for %r: %s", track.title, e)
 
 
-def ensure_prefetch(track: Track):
-    """Kick off a background resolve for a track, at most one per track."""
-    if track.prefetched or (track.prefetch_task and not track.prefetch_task.done()):
+def pump_prefetch(player: GuildPlayer):
+    """Keep the next few queued tracks resolved, one extraction at a time;
+    each completed prefetch pumps again until PREFETCH_AHEAD are ready."""
+    now = time.monotonic()
+    for track in list(player.queue)[:PREFETCH_AHEAD]:
+        if track.prefetch_failed or (track.prefetched and now - track.prefetched_at < PREFETCH_TTL):
+            continue
+        if track.prefetch_task and not track.prefetch_task.done():
+            return  # one already in flight; its done-callback pumps again
+        track.prefetch_task = asyncio.ensure_future(prefetch_track(track))
+        track.prefetch_task.add_done_callback(lambda _, p=player: pump_prefetch(p))
         return
-    track.prefetch_task = asyncio.ensure_future(prefetch_track(track))
+
+
+def _resolved_first(tracks: list) -> list:
+    """After a shuffle, float already-resolved tracks to the front — the order
+    is random either way, and it makes the next few skips instant."""
+    now = time.monotonic()
+    return sorted(tracks, key=lambda t: not (t.prefetched and now - t.prefetched_at < PREFETCH_TTL))
 
 
 def ensure_player_task(player: GuildPlayer):
@@ -797,6 +818,14 @@ async def do_stop(guild: discord.Guild):
     await update_presence()
 
 
+def skip_notice(user, player: GuildPlayer) -> str:
+    """Public skip confirmation; warns when the next song isn't resolved yet
+    so a few seconds of silence doesn't look like a dead button."""
+    nxt = player.queue[0] if player.queue else None
+    loading = "" if nxt is None or nxt.prefetched else " ⏳ Getting the next song ready…"
+    return f"⏭️ **{user.display_name}** skipped.{loading}"
+
+
 class MusicControls(discord.ui.View):
     """Persistent button bar attached to now-playing messages."""
 
@@ -840,8 +869,8 @@ class MusicControls(discord.ui.View):
     async def skip_btn(self, interaction: discord.Interaction, _):
         vc = interaction.guild.voice_client
         if vc and (vc.is_playing() or vc.is_paused()):
-            await interaction.response.send_message(f"⏭️ **{interaction.user.display_name}** skipped.")
             player = bot.get_player(interaction.guild)
+            await interaction.response.send_message(skip_notice(interaction.user, player))
             if player.loop_mode == "track":
                 player.loop_mode = "off"
             vc.stop()
@@ -867,10 +896,9 @@ class MusicControls(discord.ui.View):
         if len(player.queue) < 2:
             await interaction.response.send_message("Not enough queued songs to shuffle.", ephemeral=True)
             return
-        q = list(player.queue)
-        random.shuffle(q)
+        q = _resolved_first(random.sample(list(player.queue), len(player.queue)))
         player.queue = deque(q)
-        ensure_prefetch(player.queue[0])  # the old prefetched track is likely elsewhere now
+        pump_prefetch(player)
         await interaction.response.send_message(
             f"🔀 **{interaction.user.display_name}** shuffled {len(q)} tracks."
         )
@@ -983,8 +1011,7 @@ async def play(interaction: discord.Interaction, query: str):
     player.queue.extend(tracks)
     player.queue_event.set()
     ensure_player_task(player)
-    if player.current and player.queue:
-        ensure_prefetch(player.queue[0])  # so a skip right now lands instantly
+    pump_prefetch(player)  # so skips right now land instantly
 
     if len(tracks) == 1:
         t = tracks[0]
@@ -1008,7 +1035,7 @@ async def skip(interaction: discord.Interaction):
         if player.loop_mode == "track":
             player.loop_mode = "off"
         vc.stop()
-        await interaction.response.send_message("⏭️ Skipped.")
+        await interaction.response.send_message(skip_notice(interaction.user, player))
     else:
         await interaction.response.send_message("Nothing is playing.")
 
@@ -1059,10 +1086,9 @@ async def shuffle(interaction: discord.Interaction):
     if len(player.queue) < 2:
         await interaction.response.send_message("Not enough songs in the queue to shuffle.")
         return
-    q = list(player.queue)
-    random.shuffle(q)
+    q = _resolved_first(random.sample(list(player.queue), len(player.queue)))
     player.queue = deque(q)
-    ensure_prefetch(player.queue[0])  # the old prefetched track is likely elsewhere now
+    pump_prefetch(player)
     await interaction.response.send_message(f"🔀 Shuffled {len(q)} tracks.")
 
 
@@ -1165,8 +1191,7 @@ async def queue_saved_playlist(interaction: discord.Interaction, name: str, shuf
     player.queue.extend(tracks)
     player.queue_event.set()
     ensure_player_task(player)
-    if player.current and player.queue:
-        ensure_prefetch(player.queue[0])
+    pump_prefetch(player)
     await interaction.followup.send(
         embed=discord.Embed(
             description=f"▶️ Queued **{len(tracks)}** songs from playlist **{name}**" + (" 🔀" if shuffled else ""),
