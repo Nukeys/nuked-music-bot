@@ -243,6 +243,9 @@ class MusicBot(commands.Bot):
             log.info("No Spotify API credentials — Spotify single tracks still work via metadata lookup.")
 
     async def setup_hook(self):
+        global CONTROLS
+        CONTROLS = MusicControls()
+        self.add_view(CONTROLS)  # persistent: buttons keep working after restarts
         self.loop.create_task(start_keepalive())
         await self.tree.sync()  # global sync (can take up to an hour to propagate the first time)
 
@@ -258,9 +261,6 @@ class MusicBot(commands.Bot):
                 await self.tree.sync(guild=guild)
             except discord.HTTPException as e:
                 log.warning("Guild command cleanup failed for %s: %s", guild.name, e)
-        if not getattr(self, "_controls_registered", False):
-            self.add_view(CONTROLS)  # keeps buttons working after restarts
-            self._controls_registered = True
         await update_presence()
         log.info("Slash commands synced. Invite URL:")
         log.info(
@@ -578,11 +578,10 @@ LOOP_BADGE = {"off": "", "track": " · 🔂 looping track", "queue": " · 🔁 l
 
 
 async def update_presence():
+    # Status shows only a count — never song titles or server counts (privacy).
     active = [p for p in bot.players.values() if p.current and p.guild.voice_client]
-    if len(active) == 1:
-        name = active[0].current.title[:100]
-    elif active:
-        name = f"music in {len(active)} servers"
+    if active:
+        name = "1 song 🎶" if len(active) == 1 else f"{len(active)} songs 🎶"
     else:
         name = "/play 🎶"
     try:
@@ -727,7 +726,10 @@ class MusicControls(discord.ui.View):
         badge = {"off": "➡️ Loop off", "track": "🔂 Looping this track", "queue": "🔁 Looping the queue"}
         await interaction.response.send_message(badge[player.loop_mode], ephemeral=True)
 
-CONTROLS = MusicControls()
+# Created in setup_hook, NOT here: a View instantiated before the event loop
+# exists has no internal "stopped" future, and discord.py 2.7 silently discards
+# every press on it — the client just shows "This interaction failed".
+CONTROLS: Optional[MusicControls] = None
 
 
 @bot.tree.error
