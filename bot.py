@@ -175,6 +175,25 @@ FFMPEG_LOG = open(_FFLOG_PATH, "ab")
 _BUNDLED_FFMPEG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ffmpeg")
 FFMPEG_EXE = os.getenv("FFMPEG_PATH") or (_BUNDLED_FFMPEG if os.path.exists(_BUNDLED_FFMPEG) else "ffmpeg")
 
+# On the 0.1-CPU free tier a concurrent yt-dlp/Deno extraction (prefetching the
+# next song) briefly steals CPU from the audio ffmpeg. The default 64KB
+# ffmpeg->bot pipe only holds ~5s of 96kbps opus, so a multi-second starve
+# drains it and playback stutters — worse with a filter on, which trims the
+# CPU margin. Enlarge the pipe to ~1MB (~85s buffered) so those spikes stay
+# inaudible. Linux only (Windows pipes can't be resized this way); best-effort.
+_PIPE_BUF_BYTES = 1 << 20
+
+
+def _enlarge_audio_buffer(source: discord.FFmpegOpusAudio) -> None:
+    if sys.platform == "win32":
+        return
+    try:
+        import fcntl
+        f_setpipe_sz = getattr(fcntl, "F_SETPIPE_SZ", 1031)
+        fcntl.fcntl(source._stdout.fileno(), f_setpipe_sz, _PIPE_BUF_BYTES)
+    except (OSError, AttributeError, ValueError, ImportError):
+        pass  # a smaller buffer still works, just less stutter-resistant
+
 
 def ffmpeg_before_options(info: dict) -> str:
     """Forward yt-dlp's HTTP headers to FFmpeg — without them some CDNs (YouTube) return 403."""
@@ -197,11 +216,15 @@ def make_source(stream_url: str, info: dict, volume_pct: int, seek: float = 0.0,
     fx = AUDIO_FILTERS.get(audio_filter, "")
     if fx:
         chain.append(fx)
-    opts = f"-vn -af {','.join(chain)} -compression_level 5"
+    # compression_level 2 (was 5): the opus encoder is the bulk of ffmpeg's CPU,
+    # and on the 0.1-CPU host a lower search effort frees ~25-30% of it so the
+    # stream keeps up (and refills the buffer faster) even during a prefetch
+    # extraction. At 96kbps the quality difference is inaudible for music.
+    opts = f"-vn -af {','.join(chain)} -compression_level 2"
     # NOTE: do not pass codec= here — discord.py treats codec="libopus" as "the
     # source is already opus, just copy it", which conflicts with the volume
     # filter and kills ffmpeg instantly. Default (None) means encode with libopus.
-    return discord.FFmpegOpusAudio(
+    source = discord.FFmpegOpusAudio(
         stream_url,
         executable=FFMPEG_EXE,
         bitrate=96,
@@ -209,6 +232,8 @@ def make_source(stream_url: str, info: dict, volume_pct: int, seek: float = 0.0,
         options=opts,
         stderr=FFMPEG_LOG,
     )
+    _enlarge_audio_buffer(source)
+    return source
 
 
 def volume_amp(pct: int) -> float:
