@@ -964,41 +964,101 @@ def _resolved_first(tracks: list) -> list:
     return sorted(tracks, key=lambda t: not (t.prefetched and now - t.prefetched_at < PREFETCH_TTL))
 
 
+async def _autoplay_notify(player: GuildPlayer, msg: str) -> None:
+    """Surface an autoplay outcome in the channel. It used to fail silently,
+    which is exactly why it looked like 'autoplay doesn't even work' — the bot
+    just sat there until the idle timer instead of saying anything."""
+    if player.text_channel:
+        try:
+            await player.text_channel.send(msg)
+        except discord.HTTPException:
+            pass
+
+
+async def _seed_youtube_id(seed: Track) -> Optional[str]:
+    """Video id to seed the radio mix. Direct for YouTube seeds; for Spotify or
+    plain-search seeds whose stored URL isn't a YouTube watch link, fall back to
+    a flat title search so autoplay still has something to build a mix from."""
+    vid = _youtube_id(seed.webpage_url or seed.query)
+    if vid:
+        return vid
+    title = (seed.title or "").strip()
+    if not title:
+        return None
+    try:
+        info = await ytdl_extract({**YTDL_QUEUE_OPTS, "playlistend": 1},
+                                  f"ytsearch1:{title}", gated=False)
+    except Exception as e:
+        log.info("Autoplay seed search failed for %r: %s", title, e)
+        return None
+    for e in [x for x in (info or {}).get("entries", []) if x]:
+        return e.get("id") or _youtube_id(e.get("url") or "")
+    return None
+
+
+async def _autoplay_mix(vid: str) -> list:
+    """YouTube's auto-generated radio/mix (RD<id>) for a video, retrying once
+    past a transient datacenter bot-check — Render's IP gets them, and a single
+    unretried failure used to kill autoplay outright. Returns entry dicts."""
+    url = f"https://www.youtube.com/watch?v={vid}&list=RD{vid}"
+    for attempt in range(2):
+        try:
+            info = await ytdl_extract({**YTDL_QUEUE_OPTS, "playlistend": 25}, url, gated=False)
+            return [e for e in (info or {}).get("entries", []) if e]
+        except Exception as e:
+            if "Sign in to confirm" in str(e) and attempt == 0:
+                log.info("Autoplay mix hit a bot-check, retrying once…")
+                await asyncio.sleep(1.5)
+                continue
+            log.info("Autoplay lookup failed: %s", e)
+            return []
+    return []
+
+
 async def try_autoplay(player: GuildPlayer):
-    """When the queue empties with autoplay on, queue a song from the YouTube
-    'mix' for the last track. Best-effort: gives up on non-YouTube seeds, when
-    nothing fresh comes back, or when nobody's left in the channel."""
+    """When the queue empties with autoplay on, queue a related song from the
+    seed track's YouTube mix. Resilient to transient lookups and non-YouTube
+    seeds; says so in the channel when it genuinely can't find more."""
     vc = player.guild.voice_client
     if vc and vc.channel and not any(not m.bot for m in vc.channel.members):
         return  # don't autoplay to an empty room — let the idle timer disconnect
     seed = player.autoplay_seed
-    vid = _youtube_id(seed.webpage_url or seed.query) if seed else None
+    if not seed:
+        return
+    vid = await _seed_youtube_id(seed)
     if not vid:
+        await _autoplay_notify(player, f"🔮 Autoplay's on, but I couldn't find anything related to **{seed.title}**.")
         return
-    # RD<id> is YouTube's auto-generated radio/mix playlist for that video.
-    url = f"https://www.youtube.com/watch?v={vid}&list=RD{vid}"
-    try:
-        info = await ytdl_extract({**YTDL_QUEUE_OPTS, "playlistend": 25}, url, gated=False)
-    except Exception as e:
-        log.info("Autoplay lookup failed: %s", e)
+    entries = await _autoplay_mix(vid)
+    if not entries:
+        await _autoplay_notify(player, f"🔮 Autoplay couldn't reach YouTube's mix for **{seed.title}** right now — skipping it this time.")
         return
-    for e in [x for x in (info or {}).get("entries", []) if x]:
+    # (id, entry) for everything we could actually play (drop the seed itself)
+    candidates = []
+    for e in entries:
         eid = e.get("id") or _youtube_id(e.get("url") or "")
-        if not eid or eid == vid or eid in player.autoplay_history:
-            continue
-        track = Track(
-            query=e.get("url") or e.get("webpage_url") or f"https://www.youtube.com/watch?v={eid}",
-            title=e.get("title") or "Unknown title",
-            requested_by="Autoplay 🔮",
-            requester_id=seed.requester_id,  # inherit so the radio stays under the same preference
-            duration=e.get("duration"),
-            webpage_url=e.get("webpage_url") or e.get("url"),
-        )
-        player.queue.append(track)
-        player.queue_event.set()
-        log.info("Autoplay queued %r (seed %s)", track.title, vid)
+        if eid and eid != vid:
+            candidates.append((eid, e))
+    # prefer a track we haven't played recently; if the whole mix is stale
+    # (short mixes on repeat), replay an older one rather than stall to silence
+    pick = next((e for eid, e in candidates if eid not in player.autoplay_history), None)
+    if pick is None and candidates:
+        pick = candidates[0][1]
+    if pick is None:
+        await _autoplay_notify(player, f"🔮 Autoplay ran out of songs related to **{seed.title}**.")
         return
-    log.info("Autoplay found no fresh tracks for seed %s", vid)
+    eid = pick.get("id") or _youtube_id(pick.get("url") or "")
+    track = Track(
+        query=pick.get("url") or pick.get("webpage_url") or f"https://www.youtube.com/watch?v={eid}",
+        title=pick.get("title") or "Unknown title",
+        requested_by="Autoplay 🔮",
+        requester_id=seed.requester_id,  # inherit so the radio stays under the same preference
+        duration=pick.get("duration"),
+        webpage_url=pick.get("webpage_url") or pick.get("url"),
+    )
+    player.queue.append(track)
+    player.queue_event.set()
+    log.info("Autoplay queued %r (seed %s)", track.title, vid)
 
 
 def ensure_player_task(player: GuildPlayer):
