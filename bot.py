@@ -148,11 +148,17 @@ FFMPEG_OPTS = "-vn"
 # filter. The tempo-shifting ones (nightcore/vaporwave) move the pitch too.
 AUDIO_FILTERS = {
     "off": "",
-    "bassboost": "highpass=f=28,volume=0.5,bass=g=13:f=90:w=0.5,alimiter=level_in=2.0:limit=0.97",
+    # Bass that actually dominates: duck everything (volume), then a big low
+    # shelf so the lows sit ABOVE the mids (a plain shelf left mids louder than
+    # the "boosted" bass — why it never felt like a bass boost). Limiter is a
+    # peak safety, not loudness makeup. High-pass trims inaudible <25Hz rumble.
+    "bassboost": "highpass=f=25,volume=0.5,bass=g=18:f=100:w=0.45,alimiter=level_in=1.5:limit=0.96",
     "nightcore": "asetrate=48000*1.25,aresample=48000",
-    "vaporwave": "asetrate=48000*0.8,aresample=48000,aecho=0.8:0.7:900|1600:0.35|0.25",
-    "8d": "apulsator=hz=0.09",
-    "treble": "treble=g=6",
+    # Slowed + reverb: ~22% slower, warm (lowpass rolls off harsh highs), and a
+    # dense short-tap echo for a dreamy tail (not the old audible slap-back).
+    "vaporwave": "asetrate=48000*0.78,aresample=48000,lowpass=f=3500,aecho=0.8:0.55:110|220|360:0.35|0.28|0.2",
+    # Airy clarity boost up high (8k+) instead of a harsh 3kHz presence shelf.
+    "treble": "treble=g=7:f=7500:w=0.5,alimiter=limit=0.97",
 }
 
 # FFmpeg's own errors land here — first place to look if a song won't play
@@ -1066,6 +1072,35 @@ def skip_notice(user, player: GuildPlayer) -> str:
     return f"⏭️ **{user.display_name}** skipped.{loading}"
 
 
+class LoopMenu(discord.ui.View):
+    """Ephemeral dropdown opened by the Loop button — pick a mode directly
+    instead of blind-cycling off→track→queue. Created per press (never at
+    module level, so it always has a live event loop)."""
+
+    LABELS = {
+        "off":   ("➡️", "Off", "Play through once, then stop"),
+        "track": ("🔂", "Loop track", "Repeat the current song"),
+        "queue": ("🔁", "Loop queue", "Repeat the whole queue"),
+    }
+
+    def __init__(self, player: GuildPlayer):
+        super().__init__(timeout=60)
+        self.player = player
+        self.pick.options = [
+            discord.SelectOption(label=lbl, value=mode, description=desc,
+                                 emoji=emoji, default=(mode == player.loop_mode))
+            for mode, (emoji, lbl, desc) in self.LABELS.items()
+        ]
+
+    @discord.ui.select(placeholder="Choose a loop mode…", min_values=1, max_values=1)
+    async def pick(self, interaction: discord.Interaction, select: discord.ui.Select):
+        mode = select.values[0]
+        self.player.loop_mode = mode
+        emoji, lbl, _ = self.LABELS[mode]
+        await interaction.response.edit_message(content=f"{emoji} Loop set to **{lbl}**.", view=None)
+        self.stop()
+
+
 class MusicControls(discord.ui.View):
     """Persistent button bar attached to now-playing messages."""
 
@@ -1147,10 +1182,10 @@ class MusicControls(discord.ui.View):
     @discord.ui.button(label="Loop", emoji="🔁", style=discord.ButtonStyle.secondary, custom_id="music:loop", row=1)
     async def loop_btn(self, interaction: discord.Interaction, _):
         player = bot.get_player(interaction.guild)
-        player.loop_mode = {"off": "track", "track": "queue", "queue": "off"}[player.loop_mode]
-        badge = {"off": "➡️ Loop off", "track": "🔂 Looping this track", "queue": "🔁 Looping the queue"}
+        current = LoopMenu.LABELS[player.loop_mode][1]
         await interaction.response.send_message(
-            f"{badge[player.loop_mode]} — **{interaction.user.display_name}**"
+            f"🔁 **Loop** — currently **{current}**. Pick a mode:",
+            view=LoopMenu(player), ephemeral=True,
         )
 
 # Created in setup_hook, NOT here: a View instantiated before the event loop
@@ -1459,9 +1494,8 @@ async def volume(interaction: discord.Interaction, percent: app_commands.Range[i
     app_commands.Choice(name="Off (normal)", value="off"),
     app_commands.Choice(name="Bass boost", value="bassboost"),
     app_commands.Choice(name="Nightcore (faster + higher)", value="nightcore"),
-    app_commands.Choice(name="Vaporwave (slower + deeper)", value="vaporwave"),
-    app_commands.Choice(name="8D (rotating)", value="8d"),
-    app_commands.Choice(name="Treble boost", value="treble"),
+    app_commands.Choice(name="Vaporwave (slowed + reverb)", value="vaporwave"),
+    app_commands.Choice(name="Treble (clarity boost)", value="treble"),
 ])
 async def filter_cmd(interaction: discord.Interaction, effect: app_commands.Choice[str]):
     player = bot.get_player(interaction.guild)
