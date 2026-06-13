@@ -221,16 +221,6 @@ def fmt_duration(seconds: Optional[float]) -> str:
     return f"{h}:{m:02}:{s:02}" if h else f"{m}:{s:02}"
 
 
-def progress_bar(elapsed: float, duration: Optional[float], width: int = 16) -> str:
-    """A `0:42 ▬▬🔘▬▬ 3:30` style position bar for the now-playing card."""
-    if not duration:
-        return f"`{fmt_duration(elapsed)}` 🔴 LIVE"
-    frac = max(0.0, min(1.0, elapsed / duration))
-    pos = min(width - 1, int(frac * width))
-    bar = "".join("🔘" if i == pos else "▬" for i in range(width))
-    return f"`{fmt_duration(elapsed)}` {bar} `{fmt_duration(duration)}`"
-
-
 def current_elapsed(player: "GuildPlayer") -> float:
     """Playback position of the current song in seconds. discord.py zeroes its
     frame counter on every source swap and resume, so we add the frames sent in
@@ -289,8 +279,6 @@ class GuildPlayer:
     audio_filter: str = "off"           # ffmpeg effect applied to the whole session
     autoplay_seed: Optional[Track] = None       # last track played, used to find related songs
     autoplay_history: deque = field(default_factory=lambda: deque(maxlen=60))  # video ids already played
-    np_message: Optional[discord.Message] = None   # live now-playing card to keep updating
-    np_task: Optional[asyncio.Task] = None
 
 
 def load_playlists() -> dict:
@@ -898,11 +886,7 @@ async def player_loop(player: GuildPlayer):
 
         if player.text_channel and player.loop_mode != "track":
             try:
-                msg = await player.text_channel.send(embed=now_playing_embed(player, 0.0), view=CONTROLS)
-                player.np_message = msg
-                if player.np_task and not player.np_task.done():
-                    player.np_task.cancel()
-                player.np_task = bot.loop.create_task(np_updater(player, msg, track))
+                await player.text_channel.send(embed=now_playing_embed(player), view=CONTROLS)
             except discord.HTTPException:
                 pass
 
@@ -986,28 +970,6 @@ async def try_autoplay(player: GuildPlayer):
     log.info("Autoplay found no fresh tracks for seed %s", vid)
 
 
-async def np_updater(player: GuildPlayer, message: discord.Message, track: Track):
-    """Refresh the now-playing card's progress bar every few seconds while its
-    song is still the one playing, then stop."""
-    try:
-        while True:
-            await asyncio.sleep(15)
-            if player.current is not track:
-                return
-            vc = player.guild.voice_client
-            if not vc or not (vc.is_playing() or vc.is_paused()):
-                return
-            elapsed = current_elapsed(player)
-            try:
-                await message.edit(embed=now_playing_embed(player, elapsed), view=CONTROLS)
-            except discord.HTTPException:
-                return
-            if track.duration and elapsed >= track.duration:
-                return
-    except asyncio.CancelledError:
-        return
-
-
 def ensure_player_task(player: GuildPlayer):
     if player.task is None or player.task.done():
         player.task = bot.loop.create_task(player_loop(player))
@@ -1037,15 +999,10 @@ async def update_presence():
         pass
 
 
-def now_playing_embed(player: GuildPlayer, elapsed: Optional[float] = None) -> discord.Embed:
+def now_playing_embed(player: GuildPlayer) -> discord.Embed:
     t = player.current
-    if elapsed is None:
-        elapsed = current_elapsed(player)
     title_md = f"## [{t.title}]({t.webpage_url})" if t.webpage_url else f"## {t.title}"
-    desc = (
-        f"{title_md}\n{progress_bar(elapsed, t.duration)}\n"
-        f"`🔊 {player.volume_pct}%`  ·  requested by **{t.requested_by}**"
-    )
+    desc = f"{title_md}\n`⏱ {fmt_duration(t.duration)}`  ·  `🔊 {player.volume_pct}%`  ·  requested by **{t.requested_by}**"
     if player.queue:
         desc += f"\n-# ⏭️ Up next: {player.queue[0].title}"
     embed = discord.Embed(description=desc, color=ACCENT)
@@ -1091,8 +1048,6 @@ async def do_stop(guild: discord.Guild):
     player.queue.clear()
     player.loop_mode = "off"
     player.current = None
-    if player.np_task and not player.np_task.done():
-        player.np_task.cancel()
     vc = guild.voice_client
     if vc:
         vc.stop()
