@@ -148,7 +148,7 @@ FFMPEG_OPTS = "-vn"
 # filter. The tempo-shifting ones (nightcore/vaporwave) move the pitch too.
 AUDIO_FILTERS = {
     "off": "",
-    "bassboost": "bass=g=9",
+    "bassboost": "highpass=f=28,volume=0.5,bass=g=13:f=90:w=0.5,alimiter=level_in=2.0:limit=0.97",
     "nightcore": "asetrate=48000*1.25,aresample=48000",
     "vaporwave": "asetrate=48000*0.8,aresample=48000,aecho=0.8:0.7:900|1600:0.35|0.25",
     "8d": "apulsator=hz=0.09",
