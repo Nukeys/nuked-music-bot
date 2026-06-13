@@ -241,7 +241,8 @@ def current_elapsed(player: "GuildPlayer") -> float:
 class Track:
     query: str                      # URL or "ytsearch1:..." fed to yt-dlp at play time
     title: str
-    requested_by: str
+    requested_by: str               # display name, shown in embeds
+    requester_id: Optional[int] = None  # who queued it — decides whose autoplay setting applies
     duration: Optional[float] = None
     webpage_url: Optional[str] = None
     thumbnail: Optional[str] = None
@@ -293,10 +294,10 @@ def load_settings() -> dict:
         return {}
 
 
-def guild_settings(guild_id: int) -> dict:
-    """Per-guild toggle dict with defaults filled in (both default OFF, so the
+def user_settings(user_id: int) -> dict:
+    """Per-user toggle dict with defaults filled in (both default OFF, so the
     bot behaves exactly as before until someone flips them in /settings)."""
-    s = bot.settings.setdefault(str(guild_id), {})
+    s = bot.settings.setdefault(str(user_id), {})
     s.setdefault("search_picker", False)
     s.setdefault("autoplay", False)
     return s
@@ -402,7 +403,7 @@ class MusicBot(commands.Bot):
 
     async def _backup_settings(self):
         await self._backup_file(
-            SETTINGS_PATH, f"⚙️ settings backup · {len(self.settings)} guild(s)", "_settings_backup_msg_id"
+            SETTINGS_PATH, f"⚙️ settings backup · {len(self.settings)} user(s)", "_settings_backup_msg_id"
         )
 
     async def restore_playlists(self):
@@ -440,7 +441,7 @@ class MusicBot(commands.Bot):
                         await att.save(SETTINGS_PATH)
                         self.settings = load_settings()
                         self._settings_backup_msg_id = msg.id
-                        log.info("Restored settings for %d guild(s) from backup channel", len(self.settings))
+                        log.info("Restored settings for %d user(s) from backup channel", len(self.settings))
                         return
         except Exception:
             log.exception("Settings restore failed")
@@ -753,8 +754,14 @@ async def player_loop(player: GuildPlayer):
             if player.loop_mode == "queue" and player.current:
                 player.queue.append(player.current)
             player.current = None
-            if not player.queue and guild_settings(player.guild.id)["autoplay"]:
-                await try_autoplay(player)  # keep the music going with a related song
+            # Autoplay is decided by whoever queued the song that just ended (the
+            # seed): we keep going only if *that* person has autoplay on. Autoplay
+            # picks inherit the seed's requester, so a radio one user starts keeps
+            # flowing under their preference until someone else queues something.
+            seed = player.autoplay_seed
+            if (not player.queue and seed and seed.requester_id
+                    and user_settings(seed.requester_id)["autoplay"]):
+                await try_autoplay(player)
             if not player.queue:
                 player.queue_event.clear()
                 try:
@@ -933,6 +940,7 @@ async def try_autoplay(player: GuildPlayer):
             query=e.get("url") or e.get("webpage_url") or f"https://www.youtube.com/watch?v={eid}",
             title=e.get("title") or "Unknown title",
             requested_by="Autoplay 🔮",
+            requester_id=seed.requester_id,  # inherit so the radio stays under the same preference
             duration=e.get("duration"),
             webpage_url=e.get("webpage_url") or e.get("url"),
         )
@@ -1014,7 +1022,7 @@ def now_playing_embed(player: GuildPlayer, elapsed: Optional[float] = None) -> d
     badges = (f"{n} track{'s' if n != 1 else ''} in queue" if n else "queue empty") + LOOP_BADGE[player.loop_mode]
     if player.audio_filter != "off":
         badges += f" · 🎚️ {player.audio_filter}"
-    if guild_settings(player.guild.id)["autoplay"]:
+    if t.requester_id and user_settings(t.requester_id)["autoplay"]:
         badges += " · 🔮 autoplay"
     embed.set_footer(text=badges)
     return embed
@@ -1235,6 +1243,8 @@ async def begin_playback(interaction: discord.Interaction, tracks: list, desc: s
     player = bot.get_player(interaction.guild)
     player.text_channel = interaction.channel
 
+    for t in tracks:  # mark the requester so autoplay knows whose setting applies
+        t.requester_id = interaction.user.id
     starting_now = player.current is None and not player.queue
     player.queue.extend(tracks)
     player.queue_event.set()
@@ -1320,7 +1330,7 @@ async def play(interaction: discord.Interaction, query: str):
 
     # Search picker (opt-in): show the top hits and let the user choose, instead
     # of auto-playing the first result. Only for plain-text searches.
-    if is_search and guild_settings(interaction.guild.id)["search_picker"]:
+    if is_search and user_settings(interaction.user.id)["search_picker"]:
         try:
             results = await search_results(q, 5)
         except Exception:
@@ -1500,35 +1510,37 @@ async def clear(interaction: discord.Interaction):
 
 
 # --------------------------------------------------------------------------
-# Server settings (/settings panel)
+# Personal settings (/settings panel)
 # --------------------------------------------------------------------------
 
-def settings_embed(guild: discord.Guild) -> discord.Embed:
-    s = guild_settings(guild.id)
+def settings_embed(user: discord.abc.User) -> discord.Embed:
+    s = user_settings(user.id)
     onoff = lambda b: "🟢 **On**" if b else "⚪ Off"
     desc = (
         f"🔎 **Search picker** — {onoff(s['search_picker'])}\n"
-        "-# Show a menu of the top results to choose from, instead of auto-playing the first hit.\n\n"
+        "-# When *you* run `/play` with a search, show a menu of the top results to "
+        "choose from instead of auto-playing the first hit. Only affects your own searches.\n\n"
         f"🔮 **Autoplay** — {onoff(s['autoplay'])}\n"
-        "-# When the queue runs out, keep playing related songs instead of leaving."
+        "-# When the queue runs out after a song *you* queued, keep the music going with "
+        "related songs instead of leaving."
     )
-    embed = discord.Embed(title=f"⚙️ Settings · {guild.name}", description=desc, color=ACCENT)
-    embed.set_footer(text="Tap a button to toggle · applies to the whole server")
+    embed = discord.Embed(title=f"⚙️ {user.display_name}'s music settings", description=desc, color=ACCENT)
+    embed.set_footer(text="These are personal to you — everyone has their own.")
     return embed
 
 
 class SettingsView(discord.ui.View):
-    """Ephemeral toggle panel for the per-guild settings. Per-invocation."""
+    """Ephemeral toggle panel for the caller's personal settings. Per-invocation."""
 
-    def __init__(self, guild: discord.Guild, user: discord.abc.User):
+    def __init__(self, user: discord.abc.User):
         super().__init__(timeout=180)
-        self.guild = guild
+        self.user = user
         self.owner_id = user.id
         self.message: Optional[discord.Message] = None
         self._sync_labels()
 
     def _sync_labels(self):
-        s = guild_settings(self.guild.id)
+        s = user_settings(self.owner_id)
         self.toggle_picker.label = f"Search picker: {'ON' if s['search_picker'] else 'OFF'}"
         self.toggle_picker.style = discord.ButtonStyle.success if s["search_picker"] else discord.ButtonStyle.secondary
         self.toggle_autoplay.label = f"Autoplay: {'ON' if s['autoplay'] else 'OFF'}"
@@ -1536,7 +1548,7 @@ class SettingsView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
-            await interaction.response.send_message("Open your own with `/settings`.", ephemeral=True)
+            await interaction.response.send_message("These are someone else's — open yours with `/settings`.", ephemeral=True)
             return False
         return True
 
@@ -1550,11 +1562,11 @@ class SettingsView(discord.ui.View):
             pass
 
     async def _flip(self, interaction: discord.Interaction, key: str):
-        s = guild_settings(self.guild.id)
+        s = user_settings(self.owner_id)
         s[key] = not s[key]
         await bot.save_settings()
         self._sync_labels()
-        await interaction.response.edit_message(embed=settings_embed(self.guild), view=self)
+        await interaction.response.edit_message(embed=settings_embed(self.user), view=self)
 
     @discord.ui.button(label="Search picker", emoji="🔎", row=0)
     async def toggle_picker(self, interaction: discord.Interaction, _):
@@ -1565,10 +1577,10 @@ class SettingsView(discord.ui.View):
         await self._flip(interaction, "autoplay")
 
 
-@bot.tree.command(description="Toggle server music settings (search picker, autoplay)")
+@bot.tree.command(description="Your personal music settings (search picker, autoplay)")
 async def settings(interaction: discord.Interaction):
-    view = SettingsView(interaction.guild, interaction.user)
-    await interaction.response.send_message(embed=settings_embed(interaction.guild), view=view, ephemeral=True)
+    view = SettingsView(interaction.user)
+    await interaction.response.send_message(embed=settings_embed(interaction.user), view=view, ephemeral=True)
     try:
         view.message = await interaction.original_response()
     except discord.HTTPException:
@@ -1616,6 +1628,8 @@ async def queue_saved_playlist(interaction: discord.Interaction, name: str, shuf
     if vc is None:
         return
     tracks = [dict_to_track(d, interaction.user.display_name) for d in tracks_data]
+    for t in tracks:
+        t.requester_id = interaction.user.id
     if shuffled:
         random.shuffle(tracks)
     player = bot.get_player(interaction.guild)
