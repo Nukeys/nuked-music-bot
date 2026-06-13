@@ -101,6 +101,7 @@ YTDL_PLAY_OPTS = {
     "default_search": "ytsearch1",
     "source_address": "0.0.0.0",
     "skip_download": True,
+    "socket_timeout": 20,   # don't let a stuck network read hang the worker thread
     "extractor_args": _YT_CLIENTS,
 }
 
@@ -114,6 +115,7 @@ YTDL_QUEUE_OPTS = {
     "default_search": "ytsearch1",
     "source_address": "0.0.0.0",
     "skip_download": True,
+    "socket_timeout": 20,
     "playlistend": MAX_PLAYLIST_TRACKS,
     # full args here: playlist listing needs the regular webpage path
     "extractor_args": _YT_CLIENTS_FALLBACK,
@@ -230,11 +232,21 @@ def progress_bar(elapsed: float, duration: Optional[float], width: int = 16) -> 
 
 
 def current_elapsed(player: "GuildPlayer") -> float:
-    """Playback position of the current song in seconds, read from how many
-    20ms opus frames have actually been sent — so it doesn't advance while paused."""
+    """Playback position of the current song in seconds. discord.py zeroes its
+    frame counter on every source swap and resume, so we add the frames sent in
+    the current segment to the base offset we've tracked across those resets."""
     vc = player.guild.voice_client
     audio = getattr(vc, "_player", None) if vc else None
-    return (audio.loops * 0.02) if audio else 0.0
+    return player.play_offset + (audio.loops * 0.02 if audio else 0.0)
+
+
+def _mark_resume(player: "GuildPlayer"):
+    """Before resuming, fold the frames played so far into play_offset, because
+    discord.py resets the counter to 0 on resume."""
+    vc = player.guild.voice_client
+    audio = getattr(vc, "_player", None) if vc else None
+    if audio:
+        player.play_offset += audio.loops * 0.02
 
 
 @dataclass
@@ -271,6 +283,9 @@ class GuildPlayer:
     task: Optional[asyncio.Task] = None
     stream_url: Optional[str] = None    # current track's resolved stream (for live volume swaps)
     stream_info: Optional[dict] = None
+    play_offset: float = 0.0            # content seconds before the current ffmpeg segment
+                                        # (discord.py zeroes its frame counter on every source
+                                        # swap/resume, so we track the base position ourselves)
     audio_filter: str = "off"           # ffmpeg effect applied to the whole session
     autoplay_seed: Optional[Track] = None       # last track played, used to find related songs
     autoplay_history: deque = field(default_factory=lambda: deque(maxlen=60))  # video ids already played
@@ -500,6 +515,11 @@ async def warm_ytdlp():
 # the 512MB instance got OOM-killed (Render events, 2026-06-12). On 0.1 CPU,
 # serializing is also no slower in wall-clock time than letting them compete.
 _EXTRACT_GATE = asyncio.Semaphore(1)
+# Hard cap on any single extraction. A normal cold extraction is ~15s on this
+# host; if one runs much longer it's wedged (bad URL, network hang), and letting
+# it sit holds the gate and starves every other song. Time it out so the bot
+# stays responsive — socket_timeout above usually trips first.
+EXTRACT_TIMEOUT = 75
 
 
 async def ytdl_extract(opts: dict, query: str, gated: bool = True) -> dict:
@@ -507,13 +527,15 @@ async def ytdl_extract(opts: dict, query: str, gated: bool = True) -> dict:
     def _run():
         with yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(query, download=False)
+    async def _go():
+        return await asyncio.wait_for(loop.run_in_executor(None, _run), timeout=EXTRACT_TIMEOUT)
     if not gated:
         # flat metadata lookups (search results, playlist listings) are one
         # light HTTP call — no Deno, no formats — and may run alongside a
         # heavy extraction so /play can answer while the gate is busy
-        return await loop.run_in_executor(None, _run)
+        return await _go()
     async with _EXTRACT_GATE:
-        return await loop.run_in_executor(None, _run)
+        return await _go()
 
 
 # Everything playback/embeds actually use — the rest of a yt-dlp result (the
@@ -668,6 +690,18 @@ def _first_entry(info: Optional[dict]) -> Optional[dict]:
     return info
 
 
+def _is_playable_entry(e: dict) -> bool:
+    """Drop YouTube channel/playlist hits from flat search results — they aren't
+    songs, and trying to extract a channel as a video stalls the player. Leaves
+    real videos and non-YouTube (SoundCloud, etc.) entries alone."""
+    if (e.get("ie_key") or "") in ("YoutubeTab", "YoutubePlaylist"):
+        return False
+    url = e.get("url") or e.get("webpage_url") or ""
+    return not any(s in url for s in (
+        "youtube.com/channel/", "youtube.com/@", "youtube.com/c/", "youtube.com/user/",
+    ))
+
+
 async def resolve_query(query: str, requester: str) -> tuple[list[Track], str]:
     """Anything the user typed -> list of Tracks + description for the reply.
 
@@ -688,7 +722,7 @@ async def resolve_query(query: str, requester: str) -> tuple[list[Track], str]:
         raise RuntimeError("Nothing found for that query.")
 
     if "entries" in info:  # playlist or search results
-        entries = [e for e in info["entries"] if e][:MAX_PLAYLIST_TRACKS]
+        entries = [e for e in info["entries"] if e and _is_playable_entry(e)][:MAX_PLAYLIST_TRACKS]
         if not entries:
             raise RuntimeError("Nothing found for that query.")
         if query.startswith("ytsearch"):
@@ -721,7 +755,7 @@ async def search_results(query: str, n: int = 5) -> list[dict]:
     stream extraction), same cheap call /play already makes for a single hit."""
     opts = {**YTDL_QUEUE_OPTS, "default_search": f"ytsearch{n}"}
     info = await ytdl_extract(opts, f"ytsearch{n}:{query}", gated=False)
-    entries = [e for e in (info or {}).get("entries", []) if e][:n]
+    entries = [e for e in (info or {}).get("entries", []) if e and _is_playable_entry(e)][:n]
     return [
         {
             "title": e.get("title") or "Unknown title",
@@ -837,6 +871,7 @@ async def player_loop(player: GuildPlayer):
         source = make_source(stream_url, info, player.volume_pct, audio_filter=player.audio_filter)
         player.stream_url = stream_url
         player.stream_info = info
+        player.play_offset = 0.0   # fresh track: vc.play() starts the frame counter at 0
         player.current = track
         player.next_event.clear()
 
@@ -1110,6 +1145,7 @@ class MusicControls(discord.ui.View):
             vc.pause()
             await interaction.response.send_message(f"⏸️ **{interaction.user.display_name}** paused.")
         elif vc and vc.is_paused():
+            _mark_resume(bot.get_player(interaction.guild))
             vc.resume()
             await interaction.response.send_message(f"▶️ **{interaction.user.display_name}** resumed.")
         else:
@@ -1391,6 +1427,7 @@ async def pause(interaction: discord.Interaction):
 async def resume(interaction: discord.Interaction):
     vc = interaction.guild.voice_client
     if vc and vc.is_paused():
+        _mark_resume(bot.get_player(interaction.guild))
         vc.resume()
         await interaction.response.send_message("▶️ Resumed.")
     else:
@@ -1453,9 +1490,10 @@ async def volume(interaction: discord.Interaction, percent: app_commands.Range[i
     audio = getattr(vc, "_player", None) if vc else None
     if vc and audio and player.stream_url and (vc.is_playing() or vc.is_paused()):
         try:
-            elapsed = audio.loops * 0.02  # 20ms opus frames played so far
+            pos = current_elapsed(player)  # true position (survives earlier swaps)
             vc.source = make_source(player.stream_url, player.stream_info or {}, percent,
-                                    seek=elapsed, audio_filter=player.audio_filter)
+                                    seek=pos, audio_filter=player.audio_filter)
+            player.play_offset = pos       # the swap just reset the frame counter to 0
         except Exception:
             log.exception("Live volume swap failed — new volume applies from the next song")
 
@@ -1481,9 +1519,10 @@ async def filter_cmd(interaction: discord.Interaction, effect: app_commands.Choi
     if live:
         # restart the current stream at the same position with the effect baked in
         try:
-            elapsed = audio.loops * 0.02
+            pos = current_elapsed(player)  # true position (survives earlier swaps)
             vc.source = make_source(player.stream_url, player.stream_info or {}, player.volume_pct,
-                                    seek=elapsed, audio_filter=effect.value)
+                                    seek=pos, audio_filter=effect.value)
+            player.play_offset = pos       # the swap just reset the frame counter to 0
         except Exception:
             log.exception("Live filter swap failed — new filter applies from the next song")
 
